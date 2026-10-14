@@ -991,6 +991,7 @@ function draw() {
     }
   };
   gl.uniform1f(uA, 1); pass(0); gl.enable(gl.BLEND); gl.depthMask(false); gl.uniform1f(uA, .55); pass(1); gl.depthMask(true); gl.disable(gl.BLEND);
+  updateChunkEditOverlay();
 }
 
 const redraw = () => { if (!dirty) { dirty = 1; requestAnimationFrame(draw); } };
@@ -1023,6 +1024,106 @@ function bindPointerEvents() {
   cv.onwheel = e => { e.preventDefault(); Dst = Math.max(5, Dst * Math.exp(e.deltaY * .001)); redraw(); clearTimeout(wt); wt = setTimeout(maybe, 300); };
   cv.oncontextmenu = e => e.preventDefault();
   window.addEventListener('resize', redraw);
+}
+
+/* ---------- Chunk edit mode (preview-only) ---------- */
+let chunkEditMode = false;
+const removedPreviewChunks = new Set();
+function updateChunkEditOverlay() {
+  const overlay = document.getElementById('chunkEditOverlay');
+  if (!overlay) return;
+  overlay.replaceChildren();
+  if (!chunkEditMode || !W || !W.cols || !cv) return;
+  const rect = cv.getBoundingClientRect();
+  const overlayRect = overlay.getBoundingClientRect();
+  if (!rect.width || !rect.height || !overlayRect.width || !overlayRect.height) return;
+  const m = mat().m;
+  const svgNS = 'http://www.w3.org/2000/svg';
+  const outlineLayer = document.createElementNS(svgNS, 'svg');
+  outlineLayer.setAttribute('class', 'chunk-edit-outlines');
+  outlineLayer.setAttribute('width', '100%');
+  outlineLayer.setAttribute('height', '100%');
+  outlineLayer.setAttribute('viewBox', `0 0 ${overlayRect.width} ${overlayRect.height}`);
+  outlineLayer.setAttribute('aria-hidden', 'true');
+  overlay.appendChild(outlineLayer);
+  const project = (wx, wy, wz) => {
+    const x = wx - W.ox, z = wz - W.oz;
+    const clipX = m[0]*x + m[4]*wy + m[8]*z + m[12];
+    const clipY = m[1]*x + m[5]*wy + m[9]*z + m[13];
+    const clipW = m[3]*x + m[7]*wy + m[11]*z + m[15];
+    if (clipW <= 0) return null;
+    return {
+      x: (clipX / clipW * .5 + .5) * rect.width + rect.left - overlayRect.left,
+      y: (1 - (clipY / clipW * .5 + .5)) * rect.height + rect.top - overlayRect.top
+    };
+  };
+  let count = 0;
+  for (const col of W.cols) {
+    const [cx, cz] = unckey(col);
+    if (removedPreviewChunks.has(`${W.dim}:${cx}:${cz}`)) continue;
+    const samples = [[1,1],[14,1],[14,14],[1,14]];
+    const points = samples.map(([px,pz]) => {
+      let y = topOf(cx, cz, px, pz);
+      if (y === null || !Number.isFinite(y)) y = topOf(cx, cz, 8, 8);
+      if (y === null || !Number.isFinite(y)) y = (W.y0 + W.y1 + 1) * 8;
+      return project(cx * 16 + px + .5, y + .12, cz * 16 + pz + .5);
+    });
+    if (points.some(p => !p)) continue;
+    const xs = points.map(p => p.x), ys = points.map(p => p.y);
+    if (Math.max(...xs) < -24 || Math.max(...ys) < -24 || Math.min(...xs) > overlayRect.width + 24 || Math.min(...ys) > overlayRect.height + 24) continue;
+    const polygon = document.createElementNS(svgNS, 'polygon');
+    polygon.setAttribute('points', points.map(p => `${p.x},${p.y}`).join(' '));
+    polygon.setAttribute('class', 'chunk-edit-outline');
+    outlineLayer.appendChild(polygon);
+    const y = topOf(cx, cz, 8, 8);
+    const center = project(cx * 16 + 8, (y === null ? (W.y0 + W.y1 + 1) * 8 : y) + .3, cz * 16 + 8);
+    if (!center || center.x < -24 || center.y < -24 || center.x > overlayRect.width + 24 || center.y > overlayRect.height + 24) continue;
+    const marker = document.createElement('button');
+    marker.type = 'button'; marker.className = 'chunk-edit-marker'; marker.textContent = '✎';
+    marker.title = `チャンク (${cx}, ${cz}) を削除`;
+    marker.setAttribute('aria-label', `チャンク X=${cx}, Z=${cz} を削除`);
+    marker.style.left = `${center.x}px`; marker.style.top = `${center.y}px`;
+    marker.addEventListener('pointerdown', e => e.stopPropagation());
+    marker.addEventListener('click', e => {
+      e.stopPropagation();
+      if (!W) return;
+      const label = `ディメンション: ${['オーバーワールド','ネザー','ジ・エンド'][W.dim] || W.dim}\nチャンク X: ${cx}\nチャンク Z: ${cz}`;
+      if (!window.confirm(`${label}\n\nこのチャンクをプレビューから削除しますか？\n※元の .mcworld ファイルは変更されません。`)) return;
+      removeChunkFromPreview(cx, cz);
+    });
+    overlay.appendChild(marker); count++;
+  }
+  const status = document.getElementById('chunkEditStatus');
+  if (status) status.textContent = `チャンク上の鉛筆マークを押して削除（表示中 ${count} チャンク）`;
+}
+function removeChunkFromPreview(cx, cz) {
+  if (!W) return;
+  const dim = W.dim;
+  const col = ckey(cx, cz);
+  const backup = [];
+  for (const [k, o] of W.M) if (o.x === cx && o.z === cz) { backup.push([k, o]); W.M.delete(k); }
+  if (!backup.length && !W.cols.has(col)) return;
+  W.cols.delete(col);
+  for (let sy = W.y0; sy <= W.y1; sy++) W.MC.delete(key(cx, sy, cz));
+  removedPreviewChunks.add(`${dim}:${cx}:${cz}`);
+  if (!W.previewUndo) W.previewUndo = [];
+  W.previewUndo.push({ dim, cx, cz, col, backup });
+  const undo = document.getElementById('chunkEditUndo');
+  if (undo) undo.classList.remove('chunk-edit-hidden');
+  build();
+}
+function undoPreviewChunkRemoval() {
+  if (!W || !W.previewUndo || !W.previewUndo.length) return;
+  const item = W.previewUndo.pop();
+  const target = W.Ms.get(item.dim);
+  if (target) for (const [k, o] of item.backup) target.set(k, o);
+  if (item.dim === W.dim) {
+    W.cols.add(item.col);
+    for (let sy = W.y0; sy <= W.y1; sy++) W.MC.delete(key(item.cx, sy, item.cz));
+    removedPreviewChunks.delete(`${item.dim}:${item.cx}:${item.cz}`);
+    build();
+  }
+  if (!W.previewUndo.length) document.getElementById('chunkEditUndo')?.classList.add('chunk-edit-hidden');
 }
 
 /* ---------- Entry Points for index.html ---------- */
@@ -1101,6 +1202,17 @@ const initializeViewerUI = () => {
   const resetButton = document.getElementById('resetView');
   const fullscreenButton = document.getElementById('fullscreen');
   const viewerPanel = document.querySelector('.viewer-panel');
+  const editToggle = document.getElementById('chunkEditToggle');
+  const editOverlay = document.getElementById('chunkEditOverlay');
+  const editStatus = document.getElementById('chunkEditStatus');
+  if (editToggle) editToggle.addEventListener('click', () => {
+    chunkEditMode = !chunkEditMode;
+    editToggle.setAttribute('aria-pressed', String(chunkEditMode));
+    editToggle.textContent = chunkEditMode ? '✓ 編集モード ON' : '✎ 編集モード';
+    editOverlay?.classList.toggle('chunk-edit-hidden', !chunkEditMode);
+    editStatus?.classList.toggle('chunk-edit-hidden', !chunkEditMode);
+    updateChunkEditOverlay();
+  });
 
   if (dimensionSelect) {
     dimensionSelect.addEventListener('change', (e) => {
